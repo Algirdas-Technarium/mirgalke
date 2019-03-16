@@ -11,39 +11,61 @@
 #define BUFFER_SIZE 100 * 3
 #define BROKER_HOST "mqtt.weasel.science"
 
-char identifier[16];
-char topic_buffer[64];
-char topic_identify[64];
-char topic_alias[64];
-char topic_max_brightness[64];
-char topic_ota[64];
-char topic_wifi_reconfigure[64];
-
-void setupTopics() {
-  sprintf(topic_buffer, "/mirgalke/%s/buffer", identifier);
-  sprintf(topic_alias, "/mirgalke/%s/alias", identifier);
-  sprintf(topic_max_brightness, "/mirgalke/%s/max-brightness", identifier);
-  sprintf(topic_ota, "/mirgalke/%s/ota", identifier);
-  sprintf(topic_wifi_reconfigure, "/mirgalke/%s/wifi-reconfigure", identifier);
-}
-
 WiFiClient net;
 MQTTClient client(BUFFER_SIZE + 100);
+char identifier[16];
+char topic_identify[64];
 
-void unsubscribeAll() {
-  client.unsubscribe(topic_buffer);
-  client.unsubscribe(topic_alias);
-  client.unsubscribe(topic_max_brightness);
-  client.unsubscribe(topic_ota);
-  client.unsubscribe(topic_wifi_reconfigure);
-}
+class MqttSubscription {
+  private:
+    char topicName[32];
+    char fullTopicString[64];
+    bool isSubscribed = false;
+    char subscribedWithIdentifier[16];
+  
+  public:
+    MqttSubscription(char* newTopicName) {
+       strcpy(topicName, newTopicName);
+    }
 
-void subscribeAll() {
-  client.subscribe(topic_buffer);
-  client.subscribe(topic_alias);
-  client.subscribe(topic_max_brightness);
-  client.subscribe(topic_ota);
-  client.subscribe(topic_wifi_reconfigure);
+    void subscribeOnClient() {
+      if (!isSubscribed) {
+        client.subscribe(fullTopicString);
+        isSubscribed = true;
+        strcpy(subscribedWithIdentifier, identifier);
+      }
+    }
+
+    void unsubscribeOnClient() {
+      if (isSubscribed) {
+        client.unsubscribe(subscribedWithIdentifier);
+        isSubscribed = false;
+      }
+    }    
+
+    bool matches(char* topic) {
+      return strcmp(topic, fullTopicString) == 0;
+    }
+
+    void update() {
+      unsubscribeOnClient();
+      sprintf(fullTopicString, "/mirgalke/%s/%s", identifier, topicName);
+      subscribeOnClient();
+    }
+};
+
+MqttSubscription sub_buffer("buffer");
+MqttSubscription sub_alias("alias");
+MqttSubscription sub_max_brightness("max-brightness");
+MqttSubscription sub_ota("ota");
+MqttSubscription sub_wifi_reconfigure("wifi-reconfigure");
+
+void updateSubscriptions() {
+  sub_buffer.update();
+  sub_alias.update();
+  sub_max_brightness.update();
+  sub_ota.update();
+  sub_wifi_reconfigure.update();
 }
 
 uint8_t led_buffer[FRAMES_IN_BUFFER][BUFFER_SIZE];
@@ -76,14 +98,14 @@ void connect() {
 
   Serial.println("\nconnected!");
 
-  subscribeAll();
+  updateSubscriptions();
 }
 
 uint8_t buffer_write_key = 0;
 uint8_t framesInBuffer = 0;
 
 void messageReceived(MQTTClient *client, char topic[], char payload[], int payload_length) {
-  if (strcmp(topic, topic_buffer) == 0) {
+  if (sub_buffer.matches(topic)) {
     if (framesInBuffer < 60) {
       led_count = payload_length / 3;
       
@@ -99,15 +121,13 @@ void messageReceived(MQTTClient *client, char topic[], char payload[], int paylo
 
       maybeRenderFrame();
     }
-  } else if (strcmp(topic, topic_alias) == 0) {
-    unsubscribeAll();
+  } else if (sub_alias.matches(topic)) {
     sprintf(identifier, "%s", payload);
-    setupTopics();
-    subscribeAll();
-  } else if (strcmp(topic, topic_wifi_reconfigure) == 0) {
+    updateSubscriptions();
+  } else if (sub_wifi_reconfigure.matches(topic)) {
     WiFi.disconnect(true);
     ESP.reset();
-  } else if (strcmp(topic, topic_ota) == 0) {
+  } else if (sub_ota.matches(topic)) {
     DynamicJsonDocument doc(300);
     deserializeJson(doc, payload);
     const char* ota_host = doc["host"];
@@ -115,7 +135,7 @@ void messageReceived(MQTTClient *client, char topic[], char payload[], int paylo
     const char* ota_path = doc["path"];
     WiFiClient updateClient;
     ESPhttpUpdate.update(updateClient, ota_host, ota_port, ota_path);
-  } else if (strcmp(topic, topic_max_brightness) == 0) {
+  } else if (sub_max_brightness.matches(topic)) {
     FastLED.setBrightness(atoi(payload));
   }
 }
@@ -146,8 +166,6 @@ void setup() {
   // This allows us to see which devices are assigned which aliases
   sprintf(topic_identify, "/mirgalke/%s/identify", identifier);
   
-  setupTopics();
-
   WiFiManager wifiManager;
   wifiManager.setSaveConfigCallback(saveConfigCallback);
   WiFiManagerParameter custom_mqtt_server("server", "mqtt server", "mqtt.weasel.science", 128);
@@ -181,13 +199,11 @@ uint32_t next_frame_time = 0;
 void renderFrame() {
   if (framesInBuffer > 0) {
     for (uint8_t i = 0; i < led_count; i++) {
-      //strip->SetPixelColor(i, RgbColor(led_buffer[buffer_read_key][i * 3], led_buffer[buffer_read_key][i * 3 + 1], led_buffer[buffer_read_key][i * 3 + 2]));
       leds[i].r = led_buffer[buffer_read_key][i * 3];
       leds[i].g = led_buffer[buffer_read_key][i * 3 + 1];
       leds[i].b = led_buffer[buffer_read_key][i * 3 + 2];
     }
   
-    //strip->Show();
     FastLED.show();
 
     framesInBuffer--;
