@@ -2,12 +2,10 @@
 #include <WiFiClient.h>
 #include <MQTT.h>
 #include <WiFiManager.h>
-
-#include <NeoPixelBus.h>
 #include <FastLED.h>
-
 #include <ArduinoJson.h>
 #include <ESP8266httpUpdate.h>
+#include <EEPROM.h>
 
 #define FRAMES_IN_BUFFER 60
 #define BUFFER_SIZE 100 * 3
@@ -15,16 +13,16 @@
 
 char identifier[16];
 char topic_buffer[64];
-char topic_led_count[64];
 char topic_identify[64];
 char topic_alias[64];
+char topic_max_brightness[64];
 char topic_ota[64];
 char topic_wifi_reconfigure[64];
 
 void setupTopics() {
   sprintf(topic_buffer, "/mirgalke/%s/buffer", identifier);
-  sprintf(topic_led_count, "/mirgalke/%s/led-count", identifier);
   sprintf(topic_alias, "/mirgalke/%s/alias", identifier);
+  sprintf(topic_max_brightness, "/mirgalke/%s/max-brightness", identifier);
   sprintf(topic_ota, "/mirgalke/%s/ota", identifier);
   sprintf(topic_wifi_reconfigure, "/mirgalke/%s/wifi-reconfigure", identifier);
 }
@@ -34,54 +32,44 @@ MQTTClient client(BUFFER_SIZE + 100);
 
 void unsubscribeAll() {
   client.unsubscribe(topic_buffer);
-  client.unsubscribe(topic_led_count);
   client.unsubscribe(topic_alias);
+  client.unsubscribe(topic_max_brightness);
   client.unsubscribe(topic_ota);
   client.unsubscribe(topic_wifi_reconfigure);
 }
 
 void subscribeAll() {
   client.subscribe(topic_buffer);
-  client.subscribe(topic_led_count);
   client.subscribe(topic_alias);
+  client.subscribe(topic_max_brightness);
   client.subscribe(topic_ota);
   client.subscribe(topic_wifi_reconfigure);
 }
 
 uint8_t led_buffer[FRAMES_IN_BUFFER][BUFFER_SIZE];
-
-NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod> *strip;
 uint8_t led_count = 0;
-bool led_structures_prepared = false;
+CRGB leds[100];
 
-bool setupLedStructures() {
-  Serial.println("Setting up LED structures");
-  
-  if (led_count == 0) {
-    return false;
-  }
+char mqtt_host[128];
 
-  if (led_structures_prepared) {
-    delete strip;
-  }
-
-  strip = new NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod>(led_count, 26);
-
-  strip->Begin();
-  strip->Show();
-
-  led_structures_prepared = true;
-}
-
-void connect() {
+void connect() {  
   Serial.print("checking wifi...");
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     delay(1000);
   }
 
+  uint8_t connection_attempts = 0;
+
   Serial.print("\nconnecting...");
   while (!client.connect(identifier)) {
+    // Wait for 30 minutes before clearing all config
+    if (++connection_attempts >= 60 * 30) {
+      WiFi.disconnect(true);
+      delay(1000);
+      ESP.reset();
+    }
+    
     Serial.print(".");
     delay(1000);
   }
@@ -95,13 +83,11 @@ uint8_t buffer_write_key = 0;
 uint8_t framesInBuffer = 0;
 
 void messageReceived(MQTTClient *client, char topic[], char payload[], int payload_length) {
-  if (strcmp(topic, topic_buffer) == 0 && led_structures_prepared) {
+  if (strcmp(topic, topic_buffer) == 0) {
     if (framesInBuffer < 60) {
-      //Serial.println("Topic is buffer");
-  
-      //deserializeJson(json_doc[buffer_write_key], payload);
-
-      for (int i = 0; i < led_count * 3; i++) {
+      led_count = payload_length / 3;
+      
+      for (int i = 0; i < payload_length; i++) {
         led_buffer[buffer_write_key][i] = payload[i];
       }
   
@@ -112,21 +98,13 @@ void messageReceived(MQTTClient *client, char topic[], char payload[], int paylo
       }
 
       maybeRenderFrame();
-    } else {
-      //Serial.println("Buffer full");
     }
-  } else if (strcmp(topic, topic_led_count) == 0) {
-    //Serial.println("Topic is led_count");
-    led_count = atoi(payload);
-    setupLedStructures();
   } else if (strcmp(topic, topic_alias) == 0) {
-    Serial.printf("Alias assigned");
     unsubscribeAll();
     sprintf(identifier, "%s", payload);
     setupTopics();
     subscribeAll();
   } else if (strcmp(topic, topic_wifi_reconfigure) == 0) {
-    Serial.printf("wifi reconf"); 
     WiFi.disconnect(true);
     ESP.reset();
   } else if (strcmp(topic, topic_ota) == 0) {
@@ -137,12 +115,30 @@ void messageReceived(MQTTClient *client, char topic[], char payload[], int paylo
     const char* ota_path = doc["path"];
     WiFiClient updateClient;
     ESPhttpUpdate.update(updateClient, ota_host, ota_port, ota_path);
+  } else if (strcmp(topic, topic_max_brightness) == 0) {
+    FastLED.setBrightness(atoi(payload));
   }
+}
+
+bool wifiManagerConfigChanged = false;
+void saveConfigCallback() {
+  wifiManagerConfigChanged = true;
 }
 
 void setup() {
   Serial.begin(115200);
-  //WiFi.begin(ssid, pass);
+  Serial.println("");
+
+  EEPROM.begin(512);
+  EEPROM.get(0, mqtt_host);
+  EEPROM.end();
+
+  Serial.print("Retrieved mqtt host from eeprom: ");
+  Serial.println(mqtt_host);
+  
+  FastLED.addLeds<WS2812B, 3, GRB>(leds, 100).setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(100);
+  FastLED.show();  
 
   itoa(ESP.getChipId(), identifier, 16);
   
@@ -153,16 +149,29 @@ void setup() {
   setupTopics();
 
   WiFiManager wifiManager;
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  WiFiManagerParameter custom_mqtt_server("server", "mqtt server", "mqtt.weasel.science", 128);
+  wifiManager.addParameter(&custom_mqtt_server);
   wifiManager.autoConnect();
 
-  // Note: Local domain names (e.g. "Computer.local" on OSX) are not supported by Arduino.
-  // You need to set the IP address directly.
-  //
-  // MQTT brokers usually use port 8883 for secure connections.
-  client.begin(BROKER_HOST, 1883, net);
+  if (wifiManagerConfigChanged) {
+    strcpy(mqtt_host, custom_mqtt_server.getValue());
+
+    EEPROM.begin(512);
+    EEPROM.put(0, mqtt_host); 
+    EEPROM.commit();
+    EEPROM.end();       
+
+    Serial.print("Stored mqtt host to eeprom: ");
+    Serial.println(mqtt_host);
+  }
+
+  client.begin(mqtt_host, 1883, net);
   client.onMessageAdvanced(messageReceived);
 
-  connect();
+  //connect();
+  // This delay may prevent double mqtt connections
+  //delay(1000);
 }
 
 uint8_t buffer_read_key = 0;
@@ -170,29 +179,21 @@ uint8_t buffer_read_key = 0;
 uint32_t next_frame_time = 0;
 
 void renderFrame() {
-  if (led_structures_prepared) {
-    if (framesInBuffer > 0) {
-      //Serial.print("Will read from buffer index ");
-      //Serial.println(buffer_read_key);
-      
-      for (uint8_t i = 0; i < led_count; i++) {
-        //Serial.print("Setting pixel color for ");
-        //Serial.println(i);
-        //Serial.println(led_count);
-        
-        strip->SetPixelColor(i, RgbColor(led_buffer[buffer_read_key][i * 3], led_buffer[buffer_read_key][i * 3 + 1], led_buffer[buffer_read_key][i * 3 + 2]));
-        //strip->SetPixelColor(i, red);
-      }
-    
-      strip->Show();
+  if (framesInBuffer > 0) {
+    for (uint8_t i = 0; i < led_count; i++) {
+      //strip->SetPixelColor(i, RgbColor(led_buffer[buffer_read_key][i * 3], led_buffer[buffer_read_key][i * 3 + 1], led_buffer[buffer_read_key][i * 3 + 2]));
+      leds[i].r = led_buffer[buffer_read_key][i * 3];
+      leds[i].g = led_buffer[buffer_read_key][i * 3 + 1];
+      leds[i].b = led_buffer[buffer_read_key][i * 3 + 2];
+    }
   
-      framesInBuffer--;
-    
-      if (++buffer_read_key >= FRAMES_IN_BUFFER) {
-        buffer_read_key = 0;
-      }
-    } else {
-      //Serial.println("Buffer empty");
+    //strip->Show();
+    FastLED.show();
+
+    framesInBuffer--;
+  
+    if (++buffer_read_key >= FRAMES_IN_BUFFER) {
+      buffer_read_key = 0;
     }
   }
 }
@@ -227,8 +228,6 @@ void maybeRenderFrame() {
     }
      
     next_frame_time = millis() + time_offset;
-
-    //Serial.println(next_frame_time - millis());
   }
 }
 
@@ -245,6 +244,7 @@ void loop() {
   // delay(10);  // <- fixes some issues with WiFi stability
 
   if (!client.connected()) {
+    Serial.println("Trying to connect in loop");
     connect();
   }
 
