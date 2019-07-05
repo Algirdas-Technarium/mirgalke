@@ -72,6 +72,61 @@ uint8_t led_buffer[FRAMES_IN_BUFFER][BUFFER_SIZE];
 uint8_t led_count = 0;
 CRGB leds[100];
 
+enum ProgramStage {
+  ProgramStage_boot,
+  ProgramStage_config_reset,
+  ProgramStage_await_config_reset,
+  ProgramStage_boot_success,
+  ProgramStage_ota,
+  ProgramStage_connected_ready,
+  ProgramStage_awaiting_wifi,
+  ProgramStage_wifi_ap_active
+};
+
+// Define the function separately due to arduino ide bug
+void setProgramStage(ProgramStage stage);
+void setProgramStage(ProgramStage stage) {
+  FastLED.clear();
+  
+  switch (stage) {
+    case ProgramStage_boot: // Boot
+      leds[0] = CRGB(255, 255, 255);
+      break;
+    case ProgramStage_config_reset:
+      leds[0] = CRGB(255, 0, 0);
+      leds[2] = CRGB(0, 0, 255);
+      leds[3] = CRGB(0, 0, 255);
+      break;
+    case ProgramStage_await_config_reset:
+      leds[0] = CRGB(255, 255, 0);
+      leds[1] = CRGB(255, 255, 0);
+      break;
+    case ProgramStage_boot_success:
+      leds[0] = CRGB(0, 255, 0);
+      leds[1] = CRGB(0, 255, 0);
+      break;
+    case ProgramStage_ota:
+      leds[0] = CRGB(0, 0, 255);
+      leds[4] = CRGB(0, 0, 255);
+      break;
+    case ProgramStage_awaiting_wifi:
+      leds[0] = CRGB(255, 0, 0);
+      leds[2] = CRGB(255, 0, 0);
+      leds[4] = CRGB(255, 0, 0);
+      break;
+    case ProgramStage_connected_ready:
+      leds[0] = CRGB(0, 255, 0);
+      leds[3] = CRGB(0, 255, 0);    
+      break;
+    case ProgramStage_wifi_ap_active:
+      leds[0] = CRGB(255, 0, 0);
+      leds[1] = CRGB(0, 255, 0);
+      leds[2] = CRGB(0, 0, 255);
+  }
+  
+  FastLED.show();
+}
+
 char mqtt_host[128];
 
 void connect() {  
@@ -99,6 +154,8 @@ void connect() {
   Serial.println("\nconnected!");
 
   updateSubscriptions();
+  
+  setProgramStage(ProgramStage_connected_ready);
 }
 
 uint8_t buffer_write_key = 0;
@@ -128,6 +185,7 @@ void messageReceived(MQTTClient *client, char topic[], char payload[], int paylo
     WiFi.disconnect(true);
     ESP.reset();
   } else if (sub_ota.matches(topic)) {
+    setProgramStage(ProgramStage_ota);
     DynamicJsonDocument doc(300);
     deserializeJson(doc, payload);
     const char* ota_host = doc["host"];
@@ -145,9 +203,81 @@ void saveConfigCallback() {
   wifiManagerConfigChanged = true;
 }
 
+void configModeCallback (WiFiManager *myWiFiManager) {
+  setProgramStage(ProgramStage_wifi_ap_active);
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("");
+  
+  FastLED.addLeds<WS2812B, 3, GRB>(leds, 100).setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(100);
+  FastLED.show();
+  
+  setProgramStage(ProgramStage_boot);
+  delay(1000);
+  
+  
+  
+  // Read failed boot count
+  uint8_t failed_boot_count;
+  EEPROM.begin(512);
+  EEPROM.get(128, failed_boot_count);
+  EEPROM.end();
+
+  for (uint8_t flashFailedBootCountAnimationTimes = 0; flashFailedBootCountAnimationTimes < 5; flashFailedBootCountAnimationTimes++) {
+    FastLED.clear();
+    FastLED.show();
+    delay(500);
+    
+    if (failed_boot_count > 0) {
+      for (uint8_t i = 0; i < failed_boot_count; i++) {
+        leds[i] = CRGB(255, 0, 255);
+      }
+    } else {
+      leds[1] = CRGB(0, 255, 0);
+    }
+    
+    FastLED.show();
+    delay(500);
+  }
+  
+  FastLED.clear();
+  FastLED.show();
+  delay(1000);
+
+  if (failed_boot_count >= 3) {
+    EEPROM.begin(512);
+    EEPROM.put(128, 0);
+    EEPROM.commit();
+    EEPROM.end();    
+    
+    setProgramStage(ProgramStage_config_reset);
+    delay(2000);
+    
+    WiFi.disconnect(true);
+    ESP.reset();
+  } else {
+    EEPROM.begin(512);
+    EEPROM.put(128, ++failed_boot_count);
+    EEPROM.commit();
+    EEPROM.end();
+  }
+  
+  setProgramStage(ProgramStage_await_config_reset);
+  delay(4000);
+  
+  EEPROM.begin(512);
+  EEPROM.put(128, 0);
+  EEPROM.commit();
+  EEPROM.end();  
+  
+  setProgramStage(ProgramStage_boot_success);
+  delay(1000);
+  
+  
+  
 
   EEPROM.begin(512);
   EEPROM.get(0, mqtt_host);
@@ -155,10 +285,6 @@ void setup() {
 
   Serial.print("Retrieved mqtt host from eeprom: ");
   Serial.println(mqtt_host);
-  
-  FastLED.addLeds<WS2812B, 3, GRB>(leds, 100).setCorrection(TypicalLEDStrip);
-  FastLED.setBrightness(100);
-  FastLED.show();  
 
   itoa(ESP.getChipId(), identifier, 16);
   
@@ -166,10 +292,13 @@ void setup() {
   // This allows us to see which devices are assigned which aliases
   sprintf(topic_identify, "/mirgalke/%s/identify", identifier);
   
+  setProgramStage(ProgramStage_awaiting_wifi);
+  
   WiFiManager wifiManager;
   wifiManager.setSaveConfigCallback(saveConfigCallback);
   WiFiManagerParameter custom_mqtt_server("server", "mqtt server", "mqtt.weasel.science", 128);
   wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.setAPCallback(configModeCallback);
   wifiManager.autoConnect();
 
   if (wifiManagerConfigChanged) {
